@@ -20,10 +20,6 @@ START_MINUTE = 30  # :30 → so 4:30am
 END_HOUR = 10  # 10am
 END_MINUTE = 0  # :00 → so 10:00am
 
-# Which days of the week to run (0=Monday through 6=Sunday)
-# Default: weekdays only — do not run on weekends
-ACTIVE_DAYS = [0, 1, 2, 3, 4]
-
 # Maximum news bullets to extract per newsletter
 # Keeps each source section focused and prevents one newsletter dominating the digest
 MAX_BULLETS_PER_SOURCE = 3
@@ -36,18 +32,41 @@ PROCESSED_LOG = "processed_emails.json"  # Tracks email IDs already processed �
 RUN_LOG = "digest_log.txt"  # One line written per run — your run history
 ERROR_LOG = "digest_errors.log"  # Written only when something fails
 
+# LLM Settings — Ollama local inference, 100% free
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.2"
+OLLAMA_TIMEOUT_SECONDS = 120
+
+import os
+
+GMAIL_MCP_CREDENTIALS = os.path.expanduser("~/.config/gmail-mcp/credentials.json")
+
 # ══════════════════════════════════════════════════════
 # END CONFIGURATION — DO NOT EDIT BELOW THIS LINE
 # ══════════════════════════════════════════════════════
 
+
+def is_within_allowed_window():
+    import datetime
+
+    now = datetime.datetime.now()
+    if now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        return False
+    start = now.replace(hour=4, minute=30, second=0, microsecond=0)
+    end = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    return start <= now <= end
+
+
 import argparse
 import email.utils
 import json
-import os
 import re
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, time as dt_time
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,6 +121,173 @@ def _error_log_write(func_name: str, message: str, extra: str = "") -> None:
             f.write(line)
     except OSError as e:
         print(f"CRITICAL: could not write {ERROR_LOG}: {e}", file=sys.stderr)
+
+
+def log_error(func_name: str, message: str) -> None:
+    _error_log_write(func_name, message)
+
+
+def start_ollama() -> None:
+    subprocess.Popen(
+        ["ollama", "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(4)
+
+
+def stop_ollama() -> None:
+    subprocess.run(
+        ["pkill", "-f", "ollama"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def check_ollama_running() -> bool:
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE_URL}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m["name"] for m in data.get("models", [])]
+            if not any(OLLAMA_MODEL in m for m in models):
+                print(f"WARNING: Model '{OLLAMA_MODEL}' not found.")
+                print(f"Available: {models}")
+                print(f"Run: ollama pull {OLLAMA_MODEL}")
+                return False
+            return True
+    except Exception:
+        print("ERROR: Ollama is not responding after start attempt.")
+        return False
+
+
+OLLAMA_SYSTEM_PROMPT = """SYSTEM PROMPT:
+
+You are a senior intelligence analyst with 20 years of experience briefing executives, researchers, and decision-makers on what actually matters in the world of AI, technology, and science. You do not summarize — you analyze. Your job is to read every newsletter provided, synthesize across all of them, and produce a morning briefing that a busy, highly intelligent professional can act on in under 3 minutes.
+
+Your thinking process (internal, not shown):
+
+Read ALL newsletter content before writing a single word
+
+Ask yourself: "Would a smart person need to know this to make better decisions today?"
+
+Identify which stories appear across multiple sources — cross-source confirmation elevates importance
+
+Separate signal from noise: ignore product launches, sponsored content, listicles, opinion hot takes, and anything that is fundamentally an ad dressed as news
+
+Elevate: verified research findings, regulatory decisions, major capability shifts, geopolitical tech developments, scientific breakthroughs, and market-moving events
+Output format — strict, no deviation:
+For each item, output exactly this structure:
+📰 [Newsletter name the story came from]
+[Sharp, specific headline — not a clickbait title, not a vague summary. One sentence that tells the whole story.]
+Why it matters: [2-3 sentences explaining the real-world consequence. Who is affected? What changes because of this? What should the reader watch for next? Never restate the headline — add meaning.]
+🔗 [Source URL if available, otherwise omit]
+
+Rules:
+
+Produce between 5 and 8 items maximum. If nothing genuinely important happened, say so honestly rather than padding with filler.
+
+Rank items by significance, not by the order they appeared in emails.
+
+If the same story appeared in multiple newsletters, mention that — it signals importance. Merge them into one item.
+
+Never use phrases like "In this newsletter..." or "The author discusses..." — you are an analyst, not a summarizer.
+
+Never hallucinate details not present in the source material.
+
+If a development is early-stage or unverified, say so explicitly.
+
+Write in plain, direct, confident prose. No bullet sub-lists inside items. No emojis except the ones specified in the format.
+
+End the briefing with one sentence: "The thread across today's news:" followed by a single synthesizing observation that connects 2-3 of the top stories into a bigger pattern if one exists. If no pattern exists, omit this section entirely.
+"""
+
+# Per-email API: model must still emit JSON for parse_email(); prose briefing format applies to editorial judgment inside fields.
+_OLLAMA_JSON_SUFFIX = """
+---
+SINGLE-EMAIL REQUEST (this call): You are given ONE newsletter below. Apply the SYSTEM PROMPT standards to extract the strongest stories from this email only. Respond with ONLY valid JSON — no markdown code blocks, no prose before or after the JSON object.
+
+NEWSLETTER SOURCE: {sender_name}
+SUBJECT: {subject}
+
+FULL EMAIL TEXT:
+{cleaned_body}
+
+INSTRUCTIONS:
+Return ONLY a valid JSON object. No explanation before or after. No markdown code blocks. Just the raw JSON.
+
+{{
+  "stories": [
+    {{
+      "headline": "COMPANY NAME IN CAPS: one tight sentence describing what happened",
+      "summary": "One to two sentences: what happened and exactly why it matters. Be specific. Write like you are briefing a busy CEO.",
+      "importance": <integer 1-10>,
+      "category": "<one of: MODEL_RELEASE, FUNDING, ACQUISITION, REGULATION, RESEARCH, PRODUCT_LAUNCH, MARKET_MOVE, INSIGHT>"
+    }}
+  ],
+  "is_entirely_promotional": <true or false>
+}}
+
+If zero stories are worth including, return: {{"stories": [], "is_entirely_promotional": false}}
+If the entire email is ads with no real news, return: {{"stories": [], "is_entirely_promotional": true}}
+"""
+
+
+def build_analysis_prompt(cleaned_body: str, sender_name: str, subject: str) -> str:
+    return OLLAMA_SYSTEM_PROMPT + _OLLAMA_JSON_SUFFIX.format(
+        sender_name=sender_name, subject=subject, cleaned_body=cleaned_body
+    )
+
+
+def analyze_email_with_ollama(cleaned_body: str, sender_name: str, subject: str) -> Dict[str, Any]:
+    prompt = build_analysis_prompt(cleaned_body, sender_name, subject)
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 1200,
+            "top_p": 0.9,
+        },
+    }
+
+    raw_text = ""
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            raw_text = result.get("response", "").strip()
+
+            if raw_text.startswith("```"):
+                parts = raw_text.split("```")
+                raw_text = parts[1] if len(parts) > 1 else raw_text
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
+
+            parsed = json.loads(raw_text)
+            return parsed
+
+    except urllib.error.URLError as e:
+        log_error("analyze_email_with_ollama", f"Ollama not reachable: {e}")
+        return {"stories": [], "is_entirely_promotional": False, "error": "ollama_unreachable"}
+    except json.JSONDecodeError as e:
+        log_error(
+            "analyze_email_with_ollama",
+            f"JSON parse failed: {e}. Raw: {raw_text[:300]}",
+        )
+        return {"stories": [], "is_entirely_promotional": False, "error": "json_parse_failed"}
+    except Exception as e:
+        log_error("analyze_email_with_ollama", f"Unexpected error: {e}")
+        return {"stories": [], "is_entirely_promotional": False, "error": str(e)}
 
 
 class _HTMLStripper(HTMLParser):
@@ -163,38 +349,24 @@ def _remove_image_artifacts(text: str) -> str:
     return re.sub(r"\[(?:image|logo|img)\]", "", text, flags=re.IGNORECASE)
 
 
-def is_active_day() -> bool:
-    return datetime.now(_ny_tz()).weekday() in ACTIVE_DAYS
-
-
 class _MCPStdioSession:
     """Minimal MCP client over stdio (JSON-RPC + Content-Length framing)."""
 
     def __init__(self, argv: List[str]) -> None:
+        env = os.environ.copy()
+        if "GMAIL_MCP_CREDENTIALS" not in env:
+            env["GMAIL_MCP_CREDENTIALS"] = GMAIL_MCP_CREDENTIALS
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             bufsize=0,
         )
-        self._stderr_buf: List[str] = []
-        self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._err_thread.start()
         self._lock = threading.Lock()
         self._next_id = 1
         self._initialize()
-
-    def _drain_stderr(self) -> None:
-        if self._proc.stderr is None:
-            return
-        try:
-            for line in iter(self._proc.stderr.readline, b""):
-                if not line:
-                    break
-                self._stderr_buf.append(line.decode("utf-8", errors="replace"))
-        except Exception:
-            pass
 
     def close(self) -> None:
         if self._proc.poll() is None:
@@ -204,37 +376,18 @@ class _MCPStdioSession:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
 
-    def _read_one_message(self) -> Dict[str, Any]:
-        assert self._proc.stdout is not None
-        headers: List[str] = []
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                raise RuntimeError("MCP stdout closed unexpectedly")
-            if line in (b"\r\n", b"\n"):
-                break
-            headers.append(line.decode("utf-8", errors="replace"))
-        cl = None
-        for h in headers:
-            if h.lower().startswith("content-length:"):
-                cl = int(h.split(":", 1)[1].strip())
-                break
-        if cl is None:
-            raise RuntimeError(f"Missing Content-Length in MCP headers: {headers!r}")
-        body = b""
-        while len(body) < cl:
-            chunk = self._proc.stdout.read(cl - len(body))
-            if not chunk:
-                raise RuntimeError("Incomplete MCP body")
-            body += chunk
-        return json.loads(body.decode("utf-8"))
-
     def _write_message(self, payload: Dict[str, Any]) -> None:
         assert self._proc.stdin is not None
-        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii")
-        self._proc.stdin.write(header + raw)
+        raw = json.dumps(payload, separators=(",", ":")) + "\n"
+        self._proc.stdin.write(raw.encode("utf-8"))
         self._proc.stdin.flush()
+
+    def _read_one_message(self) -> Dict[str, Any]:
+        assert self._proc.stdout is not None
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("MCP process closed stdout unexpectedly")
+        return json.loads(line.decode("utf-8"))
 
     def _initialize(self) -> None:
         req_id = self._next_id
@@ -251,6 +404,23 @@ class _MCPStdioSession:
                 },
             }
         )
+        import threading, time
+
+        # Give the process a moment to start
+        time.sleep(2)
+
+        # Check if process already died
+        if self._proc.poll() is not None:
+            stderr_out = self._proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"MCP process exited immediately. stderr: {stderr_out}")
+
+        # Peek at stderr in background thread
+        def _drain_stderr(proc):
+            for line in proc.stderr:
+                print("[MCP stderr]", line.decode(errors="replace"), end="", flush=True)
+
+        threading.Thread(target=_drain_stderr, args=(self._proc,), daemon=True).start()
+
         while True:
             msg = self._read_one_message()
             if msg.get("id") == req_id:
@@ -575,117 +745,6 @@ def filter_unprocessed(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [e for e in emails if e.get("id") not in ps]
 
 
-def _score_story(text: str) -> int:
-    t = text.lower()
-    if re.search(r"\b(sponsor|advertisement|partner|advertise with us)\b", t):
-        return 1
-    majors = [
-        "openai",
-        "anthropic",
-        "google deepmind",
-        "deepmind",
-        "google",
-        "meta",
-        "apple",
-        "microsoft",
-        "amazon",
-        "nvidia",
-        "tesla",
-    ]
-    for m in majors:
-        if m in t and re.search(r"\b(launch|announc|released|release|unveil|introduc|ipo|acqui|merg)\b", t):
-            return 10
-    if re.search(r"\b(acquisition|merger|ipo)\b", t) or re.search(
-        r"\$\s*[1-9][0-9]{2,}\s*million|\$\s*[0-9.]+\s*billion", t
-    ):
-        if re.search(r"\$\s*[0-9.]+\s*billion", t) or re.search(
-            r"\$\s*[1-9][0-9]{2,}\s*million", t
-        ):
-            return 9
-    if re.search(
-        r"\b(llama|mistral|gemma|falcon|open[- ]source model|weights available|apache 2)\b", t
-    ) or re.search(r"\barxiv\b|\bresearch paper\b|\bnew paper\b", t):
-        return 8
-    if re.search(
-        r"\b(regulation|regulator|policy|government|court|lawsuit|legal ruling|congress|eu ai)\b", t
-    ):
-        return 7
-    if re.search(r"\b(funding|series [a-e]|raised|seed round)\b", t):
-        return 6
-    if re.search(r"\b(says|argues|analysis|according to)\b", t) and re.search(
-        r"\b(professor|researcher|ceo|cto|analyst)\b", t
-    ):
-        return 5
-    if re.search(r"\b(how to|tutorial|tips|listicle|recap|roundup)\b", t):
-        return 3
-    return 4
-
-
-def _split_segments(clean_text: str) -> List[str]:
-    if not clean_text.strip():
-        return []
-    # Newsletter item titles often end with "(N MINUTE READ)" — strong boundary for TLDR-style blocks
-    clean_text = re.sub(
-        r"\n(?=[A-Z0-9][A-Z0-9\s\-\,\.\'\"\(\)]{12,}\(\d+\s+MINUTE\s+READ\))",
-        "\n\n\n",
-        clean_text,
-        flags=re.MULTILINE,
-    )
-    parts = re.split(r"\n{3,}", clean_text)
-    segments: List[str] = []
-    for p in parts:
-        sub = re.split(r"(?=^(?:[🔥📌👀💡⚡🚀📊🧠🎁]\s))", p, flags=re.MULTILINE)
-        for s in sub:
-            s = s.strip()
-            if not s:
-                continue
-            lines = s.splitlines()
-            buf: List[str] = []
-            for line in lines:
-                if re.match(r"^[A-Z0-9][A-Z0-9\s\&\-\,\.\'\"]{6,}$", line.strip()) and len(
-                    line.strip()
-                ) < 120:
-                    if buf:
-                        segments.append("\n".join(buf).strip())
-                        buf = []
-                    buf.append(line.strip())
-                    continue
-                if re.match(r"^\d+\.\s+", line.strip()):
-                    if buf:
-                        segments.append("\n".join(buf).strip())
-                        buf = []
-                buf.append(line)
-            if buf:
-                segments.append("\n".join(buf).strip())
-    extra: List[str] = []
-    for seg in segments:
-        for piece in re.split(r"\n(?=\d+\.\s+)", seg):
-            piece = piece.strip()
-            if piece:
-                extra.append(piece)
-    segments = extra
-    out: List[str] = []
-    for seg in segments:
-        for piece in re.split(r"\n(?=[•\-]\s+)", seg):
-            piece = piece.strip()
-            if piece:
-                out.append(piece)
-    return [x for x in out if len(x) >= 20]
-
-
-def _headline_summary(segment: str) -> Tuple[str, str]:
-    lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
-    if not lines:
-        return "", ""
-    headline = lines[0][:120]
-    rest = " ".join(lines[1:])
-    rest = re.sub(r"\s+", " ", rest).strip()
-    summary = rest[:280]
-    if summary and summary[-1] not in ".!?":
-        summary += "."
-    return headline, summary
-
-
 def _company_caps(headline: str, segment: str) -> str:
     m = re.match(r"^([^:]+):", headline)
     if m:
@@ -702,7 +761,8 @@ def _company_caps(headline: str, segment: str) -> str:
     return pick or "NEWS"
 
 
-def parse_email(raw_email: Dict[str, Any]) -> Dict[str, Any]:
+def parse_email(raw_email: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Returns (parsed_dict or None, skip_reason). skip_reason is '' on success."""
     eid = str(raw_email["id"])
     from_hdr = raw_email.get("from_header", "")
     sender_name, sender_email = _parse_from_header(from_hdr)
@@ -719,37 +779,65 @@ def parse_email(raw_email: Dict[str, Any]) -> Dict[str, Any]:
     body = _remove_image_artifacts(body)
     body = _collapse_blank_lines(body)
 
-    segments = _split_segments(body)
+    llm = analyze_email_with_ollama(body, sender_name, subject)
+    err = llm.get("error")
+    if err == "ollama_unreachable":
+        _error_log_write(
+            "parse_email",
+            "Ollama unreachable",
+            extra=f"subject={subject} from={from_hdr}",
+        )
+        return None, "ollama_unreachable"
+    if err:
+        _error_log_write(
+            "parse_email",
+            f"LLM error: {err}",
+            extra=f"subject={subject} from={from_hdr}",
+        )
+        return None, "llm_error"
+    if llm.get("is_entirely_promotional"):
+        _error_log_write(
+            "parse_email",
+            "Skipped: is_entirely_promotional",
+            extra=f"subject={subject} from={from_hdr}",
+        )
+        return None, "promotional"
+
     stories: List[Dict[str, Any]] = []
-    for seg in segments:
-        headline, summary = _headline_summary(seg)
-        if not headline:
+    for s in llm.get("stories") or []:
+        headline = (s.get("headline") or "").strip()
+        summary = (s.get("summary") or "").strip()
+        if not headline and not summary:
             continue
-        blob = headline + " " + summary
-        score = _score_story(blob)
-        if score <= 1:
-            continue
+        imp = int(s.get("importance", 5))
         stories.append(
             {
                 "headline": headline,
                 "summary": summary,
-                "importance_score": score,
-                "company_caps": _company_caps(headline, seg),
-                "dedupe_key": re.sub(r"[^a-z0-9]+", " ", headline.lower()).strip(),
+                "importance": imp,
+                "importance_score": imp,
+                "company_caps": _company_caps(headline or summary, headline + " " + summary),
+                "dedupe_key": re.sub(
+                    r"[^a-z0-9]+", " ", (headline or summary).lower()
+                ).strip(),
+                "category": s.get("category", ""),
             }
         )
 
-    return {
-        "id": eid,
-        "sender_name": sender_name,
-        "sender_email": sender_email,
-        "subject": subject,
-        "received_at": recv,
-        "stories": stories,
-    }
+    return (
+        {
+            "id": eid,
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "subject": subject,
+            "received_at": recv,
+            "stories": stories,
+        },
+        "",
+    )
 
 
-def rank_and_cap(
+def cap_and_select(
     parsed_emails: List[Dict[str, Any]]
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Returns (top_story dict or None, list of source buckets with capped stories)."""
@@ -757,7 +845,7 @@ def rank_and_cap(
     all_scored: List[Tuple[int, str, Dict[str, Any], Dict[str, Any]]] = []
     for pe in parsed_emails:
         stories = sorted(
-            pe.get("stories") or [], key=lambda s: s["importance_score"], reverse=True
+            pe.get("stories") or [], key=lambda s: s.get("importance", s.get("importance_score", 0)), reverse=True
         )[:MAX_BULLETS_PER_SOURCE]
         if not stories:
             continue
@@ -772,7 +860,7 @@ def rank_and_cap(
             uid = f"{pe['id']}:{idx}"
             st2["_story_uid"] = uid
             b["stories"].append(st2)
-            all_scored.append((st2["importance_score"], uid, st2, b))
+            all_scored.append((st2.get("importance", st2.get("importance_score", 0)), uid, st2, b))
         buckets.append(b)
 
     if not all_scored:
@@ -793,7 +881,14 @@ def rank_and_cap(
     flat: List[Tuple[int, str, Dict[str, Any], Dict[str, Any]]] = []
     for b in buckets:
         for s in b["stories"]:
-            flat.append((s["importance_score"], s["_story_uid"], s, b))
+            flat.append(
+                (
+                    s.get("importance", s.get("importance_score", 0)),
+                    s["_story_uid"],
+                    s,
+                    b,
+                )
+            )
     flat.sort(key=lambda x: (-x[0], x[1]))
     kept_uids = {uid for _, uid, _, _ in flat[:MAX_TOTAL_BULLETS]}
     for b in buckets:
@@ -824,7 +919,12 @@ def deduplicate_stories(
     for b in ranked_emails:
         for s in list(b.get("stories", [])):
             items.append((b, s))
-    items.sort(key=lambda x: (-x[1]["importance_score"], x[0].get("sender_name", "")))
+    items.sort(
+        key=lambda x: (
+            -x[1].get("importance", x[1].get("importance_score", 0)),
+            x[0].get("sender_name", ""),
+        )
+    )
 
     clusters: List[Dict[str, Any]] = []
 
@@ -851,7 +951,9 @@ def deduplicate_stories(
         ws = matched["winner_story"]
         if s is ws and b is wb:
             continue
-        if s["importance_score"] > ws["importance_score"]:
+        si = s.get("importance", s.get("importance_score", 0))
+        wi = ws.get("importance", ws.get("importance_score", 0))
+        if si > wi:
             if ws in wb.get("stories", []):
                 wb["stories"].remove(ws)
             matched["winner_bucket"] = b
@@ -926,7 +1028,7 @@ def build_digest(
     for b in sorted(
         ranked_emails,
         key=lambda x: -(
-            sum(s["importance_score"] for s in x.get("stories", []))
+            sum(s.get("importance", s.get("importance_score", 0)) for s in x.get("stories", []))
             / max(1, len(x.get("stories", [])))
         ),
     ):
@@ -945,6 +1047,7 @@ def build_digest(
     srcs = stats.get("source_names", [])
     dup = stats.get("duplicate_merges", 0)
     failed_parse = stats.get("parse_failures", 0)
+    skipped_promo = stats.get("emails_skipped_promotional", 0)
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("📊 DIGEST STATS")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -952,6 +1055,11 @@ def build_digest(
     lines.append(f"📬 Emails processed: {stats.get('emails_processed', 0)}")
     lines.append(f"🗞️ Sources today: {', '.join(srcs) if srcs else '(none)'}")
     lines.append("⏱️ Time window scanned: 4:30am – 10:00am EST")
+    lines.append(
+        f"🤖 Intelligence: Ollama local LLM ({OLLAMA_MODEL}) — 100% private, zero cost"
+    )
+    lines.append("⏰ Active window: Mon–Fri 4:30am–10:00am only")
+    lines.append(f"⏭️  Emails skipped (fully promotional): {skipped_promo}")
     if failed_parse:
         lines.append(
             f"⚠️ {failed_parse} email(s) failed to parse — see digest_errors.log"
@@ -1038,16 +1146,15 @@ def main() -> int:
     args = parser.parse_args()
     dry = args.dry_run
 
-    # STEP 1 — DAY CHECK
-    if os.environ.get("DIGEST_FORCE_RUN", "").strip() not in ("1", "true", "yes"):
-        if not is_active_day():
-            day_name = datetime.now(_ny_tz()).strftime("%A")
-            print(f"Today is {day_name} — not a weekday. Skipping run.")
-            return 0
+    _force = os.environ.get("DIGEST_FORCE_RUN", "").strip().lower() in ("1", "true", "yes")
+    if not is_within_allowed_window() and not _force:
+        print("Outside allowed window (Mon–Fri 4:30am–10:00am). Exiting.")
+        return 0
 
     stats: Dict[str, Any] = {
         "emails_found": 0,
         "emails_processed": 0,
+        "emails_skipped_promotional": 0,
         "bullets_generated": 0,
         "recipients": len(DIGEST_RECIPIENTS),
         "recipients_attempted": len(DIGEST_RECIPIENTS),
@@ -1058,164 +1165,217 @@ def main() -> int:
     }
 
     try:
-        # STEP 2 — FETCH EMAILS
-        try:
-            raw_list = fetch_emails_in_window()
-        except Exception as e:
-            _error_log_write("fetch_emails_in_window", str(e), "")
-            subj = f"⚠️ Digest Agent Error — {_now_ny().strftime('%B %d, %Y')}"
+        start_ollama()
+        if not check_ollama_running():
+            subj = "⚠️ Digest Agent Error — Ollama not running"
             body = (
-                f"The digest agent failed to read emails from {SOURCE_EMAIL} at "
-                f"{_now_ny().strftime('%I:%M %p %Z')}. Error: {e}. "
-                f"Please check digest_errors.log for details."
+                f"Ollama did not become ready at {OLLAMA_BASE_URL} after start_ollama() "
+                f"at {_now_ny().strftime('%I:%M %p %Z')}. Check digest_errors.log."
             )
-            try:
-                alert_res = _send_email_mcp(subj, body)
-                if not dry:
-                    stats["recipients_ok"] = len(alert_res.get("ok", []))
-            except Exception as se:
-                _error_log_write("main", f"Could not send alert email: {se}", "")
-                if not dry:
-                    stats["recipients_ok"] = 0
             if not dry:
-                stats["status"] = "FAILED"
-                log_run(stats)
-            return 1
-
-        stats["emails_found"] = len(raw_list)
-        # STEP 3 — DEDUPLICATE
-        unproc = filter_unprocessed(raw_list)
-        stats["emails_found_window_unprocessed"] = len(unproc)
-
-        ny = _now_ny()
-        if len(raw_list) == 0:
-            subj = f"⚠️ No newsletters found — {ny.strftime('%B %d, %Y')}"
-            body = (
-                f"No emails were received in {SOURCE_EMAIL} between 4:30am–10:00am EST today "
-                f"({ny.strftime('%B %d, %Y')}). The agent ran and checked successfully at "
-                f"{ny.strftime('%I:%M %p %Z')}."
-            )
-            if dry:
+                _send_email_mcp(subj, body)
+            else:
                 print(subj)
                 print(body)
+            return 1
+
+        try:
+            # STEP 2 — FETCH EMAILS
+            try:
+                raw_list = fetch_emails_in_window()
+            except Exception as e:
+                _error_log_write("fetch_emails_in_window", str(e), "")
+                subj = f"⚠️ Digest Agent Error — {_now_ny().strftime('%B %d, %Y')}"
+                body = (
+                    f"The digest agent failed to read emails from {SOURCE_EMAIL} at "
+                    f"{_now_ny().strftime('%I:%M %p %Z')}. Error: {e}. "
+                    f"Please check digest_errors.log for details."
+                )
+                if dry:
+                    print(subj, file=sys.stderr)
+                    print(body, file=sys.stderr)
+                try:
+                    alert_res = _send_email_mcp(subj, body)
+                    if not dry:
+                        stats["recipients_ok"] = len(alert_res.get("ok", []))
+                except Exception as se:
+                    _error_log_write("main", f"Could not send alert email: {se}", "")
+                    if dry:
+                        print(f"(Alert email not sent: {se})", file=sys.stderr)
+                    if not dry:
+                        stats["recipients_ok"] = 0
+                if not dry:
+                    stats["status"] = "FAILED"
+                    log_run(stats)
+                return 1
+
+            stats["emails_found"] = len(raw_list)
+            # STEP 3 — DEDUPLICATE
+            unproc = filter_unprocessed(raw_list)
+            stats["emails_found_window_unprocessed"] = len(unproc)
+
+            ny = _now_ny()
+            if len(raw_list) == 0:
+                subj = f"⚠️ No newsletters found — {ny.strftime('%B %d, %Y')}"
+                body = (
+                    f"No emails were received in {SOURCE_EMAIL} between 4:30am–10:00am EST today "
+                    f"({ny.strftime('%B %d, %Y')}). The agent ran and checked successfully at "
+                    f"{ny.strftime('%I:%M %p %Z')}."
+                )
+                if dry:
+                    print(subj)
+                    print(body)
+                    return 0
+                send_res = _send_email_mcp(subj, body)
+                stats["recipients_ok"] = len(send_res.get("ok", []))
+                if len(send_res.get("fail", [])) == len(DIGEST_RECIPIENTS):
+                    _error_log_write(
+                        "main",
+                        "All sends failed for no-newsletters notice",
+                        extra=body,
+                    )
+                    stats["status"] = "FAILED"
+                    log_run(stats)
+                    return 1
+                stats["emails_processed"] = 0
+                stats["bullets_generated"] = 0
+                log_run(stats)
                 return 0
-            send_res = _send_email_mcp(subj, body)
+
+            if len(unproc) == 0:
+                print(
+                    "All emails in today's window were already processed; no new digest needed."
+                )
+                if not dry:
+                    stats["status"] = "SUCCESS"
+                    stats["emails_processed"] = 0
+                    stats["bullets_generated"] = 0
+                    stats["recipients_ok"] = 0
+                    log_run(stats)
+                return 0
+
+            parsed_list: List[Dict[str, Any]] = []
+            processed_ids: List[str] = []
+            ollama_unreachable_count = 0
+
+            # STEP 4 — PARSE EACH EMAIL (LLM)
+            for raw in unproc:
+                try:
+                    parsed, skip_reason = parse_email(raw)
+                except Exception as e:
+                    stats["parse_failures"] += 1
+                    _error_log_write(
+                        "parse_email",
+                        str(e),
+                        extra=f"subject={raw.get('subject','')} from={raw.get('from_header','')}",
+                    )
+                    continue
+
+                if parsed is None:
+                    if skip_reason == "promotional":
+                        stats["emails_skipped_promotional"] += 1
+                        processed_ids.append(str(raw["id"]))
+                    elif skip_reason == "ollama_unreachable":
+                        ollama_unreachable_count += 1
+                    elif skip_reason == "llm_error":
+                        stats["parse_failures"] += 1
+                    continue
+
+                parsed_list.append(parsed)
+                processed_ids.append(parsed["id"])
+
+            if unproc and not parsed_list and ollama_unreachable_count == len(unproc):
+                subj = "⚠️ Digest Agent Error — Ollama not running"
+                body = (
+                    f"Ollama was unreachable for every newsletter email at "
+                    f"{_now_ny().strftime('%I:%M %p %Z')}. No digest was produced. "
+                    f"See digest_errors.log."
+                )
+                if not dry:
+                    _send_email_mcp(subj, body)
+                    stats["status"] = "FAILED"
+                    log_run(stats)
+                else:
+                    print(subj)
+                    print(body)
+                return 1
+
+            # STEP 5 — CAP AND SELECT
+            top_story, ranked = cap_and_select(parsed_list)
+            # STEP 6 — DEDUPLICATE STORIES
+            ranked, dmerge = deduplicate_stories(ranked)
+            stats["duplicate_merges"] = dmerge
+            stats["source_names"] = sorted({p["sender_name"] for p in parsed_list})
+            bullets = 0
+            if top_story:
+                bullets += 1
+            for b in ranked:
+                bullets += len(b.get("stories", []))
+            stats["bullets_generated"] = bullets
+            stats["emails_processed"] = len(parsed_list)
+
+            # STEP 7 — BUILD DIGEST
+            digest_text = build_digest(top_story, ranked, stats)
+
+            if dry:
+                print(
+                    "SUBJECT: 🤖 AI Morning Digest — "
+                    f"{ny.strftime('%A, %B ')}{int(ny.strftime('%d'))}, {ny.strftime('%Y')}"
+                )
+                print()
+                print(digest_text)
+                print()
+                print(
+                    f"[dry-run] emails_fetched={len(raw_list)} unprocessed={len(unproc)} "
+                    f"parsed={len(parsed_list)} bullets={bullets}"
+                )
+                if top_story:
+                    ts = top_story["story"]
+                    print(
+                        f"[dry-run] TOP STORY: importance={ts.get('importance', ts.get('importance_score'))} "
+                        f"headline={ts.get('headline','')[:100]!r}"
+                    )
+                for b in ranked:
+                    print(
+                        f"[dry-run] Source {b.get('sender_name')!r}: "
+                        f"{len(b.get('stories',[]))} stories after cap/dedupe"
+                    )
+                return 0
+
+            # STEP 8 — SEND DIGEST
+            send_res = send_digest(digest_text)
             stats["recipients_ok"] = len(send_res.get("ok", []))
-            if len(send_res.get("fail", [])) == len(DIGEST_RECIPIENTS):
+            if len(send_res.get("ok", [])) == 0:
                 _error_log_write(
                     "main",
-                    "All sends failed for no-newsletters notice",
-                    extra=body,
+                    "All digest sends failed; full digest preserved below",
+                    extra=digest_text[:20000],
                 )
                 stats["status"] = "FAILED"
                 log_run(stats)
                 return 1
-            stats["emails_processed"] = 0
-            stats["bullets_generated"] = 0
-            log_run(stats)
-            return 0
 
-        if len(unproc) == 0:
-            print(
-                "All emails in today's window were already processed; no new digest needed."
-            )
-            if not dry:
-                stats["status"] = "SUCCESS"
-                stats["emails_processed"] = 0
-                stats["bullets_generated"] = 0
-                stats["recipients_ok"] = 0
-                log_run(stats)
-            return 0
-
-        parsed_list: List[Dict[str, Any]] = []
-        processed_ids: List[str] = []
-        # STEP 4 — PARSE EACH EMAIL
-        for raw in unproc:
-            try:
-                parsed = parse_email(raw)
-                parsed_list.append(parsed)
-                processed_ids.append(parsed["id"])
-            except Exception as e:
-                stats["parse_failures"] += 1
+            # STEP 9 — UPDATE PROCESSED LOG
+            update_processed_log(processed_ids)
+            if send_res.get("fail"):
+                stats["status"] = "PARTIAL"
                 _error_log_write(
-                    "parse_email",
-                    str(e),
-                    extra=f"subject={raw.get('subject','')} from={raw.get('from_header','')}",
+                    "main",
+                    "Some recipients failed",
+                    extra=str(send_res["fail"]),
                 )
-
-        # STEP 5 — RANK AND CAP
-        top_story, ranked = rank_and_cap(parsed_list)
-        # STEP 6 — DEDUPLICATE STORIES
-        ranked, dmerge = deduplicate_stories(ranked)
-        stats["duplicate_merges"] = dmerge
-        stats["source_names"] = sorted({p["sender_name"] for p in parsed_list})
-        bullets = 0
-        if top_story:
-            bullets += 1
-        for b in ranked:
-            bullets += len(b.get("stories", []))
-        stats["bullets_generated"] = bullets
-        stats["emails_processed"] = len(parsed_list)
-
-        # STEP 7 — BUILD DIGEST
-        digest_text = build_digest(top_story, ranked, stats)
-
-        if dry:
-            print(
-                "SUBJECT: 🤖 AI Morning Digest — "
-                f"{ny.strftime('%A, %B ')}{int(ny.strftime('%d'))}, {ny.strftime('%Y')}"
-            )
-            print()
-            print(digest_text)
-            print()
-            print(
-                f"[dry-run] emails_fetched={len(raw_list)} unprocessed={len(unproc)} "
-                f"parsed={len(parsed_list)} bullets={bullets}"
-            )
-            if top_story:
-                ts = top_story["story"]
-                print(
-                    f"[dry-run] TOP STORY: score={ts.get('importance_score')} "
-                    f"headline={ts.get('headline','')[:100]!r}"
-                )
-            for b in ranked:
-                print(
-                    f"[dry-run] Source {b.get('sender_name')!r}: "
-                    f"{len(b.get('stories',[]))} stories after rank/dedupe"
-                )
+            # STEP 10 — LOG THE RUN
+            log_run(stats)
             return 0
 
-        # STEP 8 — SEND DIGEST
-        send_res = send_digest(digest_text)
-        stats["recipients_ok"] = len(send_res.get("ok", []))
-        if len(send_res.get("ok", [])) == 0:
-            _error_log_write(
-                "main",
-                "All digest sends failed; full digest preserved below",
-                extra=digest_text[:20000],
-            )
-            stats["status"] = "FAILED"
-            log_run(stats)
-            return 1
-
-        # STEP 9 — UPDATE PROCESSED LOG
-        update_processed_log(processed_ids)
-        if send_res.get("fail"):
-            stats["status"] = "PARTIAL"
-            _error_log_write(
-                "main",
-                "Some recipients failed",
-                extra=str(send_res["fail"]),
-            )
-        # STEP 10 — LOG THE RUN
-        log_run(stats)
-        return 0
+        finally:
+            global _mcp_session
+            if _mcp_session is not None:
+                _mcp_session.close()
+                _mcp_session = None
 
     finally:
-        global _mcp_session
-        if _mcp_session is not None:
-            _mcp_session.close()
-            _mcp_session = None
+        stop_ollama()
 
 
 if __name__ == "__main__":

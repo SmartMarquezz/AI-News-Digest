@@ -1,6 +1,6 @@
 # AI & Tech News Digest
 
-This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), pulls out the highest-signal items using rules-based text processing (no external AI APIs), and emails you **one** plain-text digest grouped by newsletter. A processed-ID log stops the same email from being summarized twice.
+This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), extracts the highest-signal items with a **local Ollama** model (e.g. llama3.2) and **no paid APIs**, and emails you **one** plain-text digest grouped by newsletter. A processed-ID log stops the same email from being summarized twice.
 
 ## Add a new recipient
 
@@ -28,9 +28,9 @@ END_HOUR = 10
 END_MINUTE = 0
 ```
 
-## Change which days it runs
+## When the script is allowed to run (Ollama)
 
-Edit `ACTIVE_DAYS` in `digest.py`. Days are `0 = Monday` through `6 = Sunday`. The default `[0, 1, 2, 3, 4]` is weekdays only.
+The script only starts **Ollama** on **Monday–Friday**, **4:30am–10:00am local time** (`is_within_allowed_window()` in `digest.py`). Outside that window it exits immediately (unless `DIGEST_FORCE_RUN=1` for testing). Schedule the run with **cron** using `crontab-schedule.txt` in this repo.
 
 ## Run the script manually
 
@@ -82,16 +82,6 @@ Copy the `command` and `args` from your Cursor MCP settings if yours differ. The
 3. Confirm Gmail MCP still works in Cursor (send/search a test message).
 4. Confirm your scheduled environment sets the same `GMAIL_MCP_*` variables and can run `npx` (or your server command) non-interactively.
 
-## Cursor Automation (weekdays at 10:00am)
+## Cron schedule (recommended)
 
-1. In Cursor, open **Automations** (or your workspace automation UI).
-2. Create a **schedule** trigger: **Monday–Friday** at **10:00 AM** in your local timezone (adjust if you want exactly America/New_York).
-3. Add an action **Run command** (or **Shell**), working directory = this project folder:
-
-   ```bash
-   python3 digest.py
-   ```
-
-4. Ensure the automation environment includes the same Gmail MCP server configuration (`GMAIL_MCP_COMMAND`, `GMAIL_MCP_ARGS`, and any paths your OAuth tokens use).
-
-If your automation cannot spawn the MCP subprocess, run the agent from Cursor with MCP enabled and use a wrapper that performs the Gmail steps there; the parsing and digest layout still live in `digest.py`.
+Paste the two lines from **`crontab-schedule.txt`** into your crontab (`crontab -e`). That runs the digest at **4:30am** on weekdays and **`pkill -f ollama`** at **10:00am** as a safety net. Ensure `PATH` in your environment includes `npx` / Homebrew if needed.

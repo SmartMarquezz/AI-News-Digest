@@ -1,0 +1,2 @@
+30 4 * * 1-5 cd ~/AI\ News\ Digest && /usr/bin/python3 digest.py
+0 10 * * 1-5 pkill -f ollama
