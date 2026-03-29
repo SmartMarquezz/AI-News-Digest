@@ -1,0 +1,7 @@
+processed_emails.json
+digest_log.txt
+digest_errors.log
+*.env
+__pycache__/
+*.pyc
+.DS_Store
