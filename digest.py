@@ -20,6 +20,13 @@ START_MINUTE = 30  # :30 → so 4:30am
 END_HOUR = 10  # 10am
 END_MINUTE = 0  # :00 → so 10:00am
 
+# When digest.py is allowed to run (weekdays; schedule cron to match). This is separate from the
+# email window above: we still list and filter messages using 4:30am–10:00am, but the job runs once
+# after that window closes so every eligible email is included in one digest.
+RUN_DIGEST_HOUR = 10
+RUN_DIGEST_MINUTE = 5
+RUN_DIGEST_GRACE_MINUTES = 60  # latest start time after RUN_DIGEST_* (handles cron skew / long runs)
+
 # Maximum news bullets to extract per newsletter
 # Keeps each source section focused and prevents one newsletter dominating the digest
 MAX_BULLETS_PER_SOURCE = 3
@@ -47,27 +54,35 @@ GMAIL_MCP_CREDENTIALS = os.path.expanduser("~/.config/gmail-mcp/credentials.json
 
 
 def is_within_allowed_window():
-    import datetime
-
-    now = datetime.datetime.now()
+    now = datetime.now()
     if now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
         return False
-    start = now.replace(hour=4, minute=30, second=0, microsecond=0)
-    end = now.replace(hour=10, minute=0, second=0, microsecond=0)
-    return start <= now <= end
+    run_start = now.replace(
+        hour=RUN_DIGEST_HOUR,
+        minute=RUN_DIGEST_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    run_end = run_start + timedelta(minutes=RUN_DIGEST_GRACE_MINUTES)
+    return run_start <= now <= run_end
 
 
 import argparse
+import base64
 import email.utils
+import asyncio
 import json
+import aiohttp
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,22 +101,18 @@ def _ny_tz():
     return ZoneInfo(NY_TZ_NAME)
 
 
-# --- MCP stdio (Gmail MCP server subprocess). Configure for unattended runs:
-# GMAIL_MCP_COMMAND: executable, e.g. npx
-# GMAIL_MCP_ARGS: space-separated args, e.g. -y @scope/package
+# --- MCP HTTP (gmail-mcp server running on localhost:3000)
 # Optional overrides: GMAIL_MCP_TOOL_SEARCH, GMAIL_MCP_TOOL_READ, GMAIL_MCP_TOOL_SEND
-GMAIL_MCP_COMMAND = os.environ.get("GMAIL_MCP_COMMAND", "npx")
-GMAIL_MCP_ARGS = os.environ.get("GMAIL_MCP_ARGS", "-y @shinzolabs/gmail-mcp").split()
 # Default flavor matches the default package (@shinzolabs/gmail-mcp). For servers that expose
-# search_emails / read_email / send_message (common in other Gmail MCP builds), set
-# GMAIL_MCP_FLAVOR=cursor or export GMAIL_MCP_TOOL_* overrides.
+# read_email / send_email (common in other Gmail MCP builds), set GMAIL_MCP_FLAVOR=cursor or
+# export GMAIL_MCP_TOOL_* overrides.
 _FLAVOR = os.environ.get("GMAIL_MCP_FLAVOR", "shinzo").lower()
 if _FLAVOR == "shinzo":
     GMAIL_MCP_TOOL_SEARCH = os.environ.get("GMAIL_MCP_TOOL_SEARCH", "list_messages")
     GMAIL_MCP_TOOL_READ = os.environ.get("GMAIL_MCP_TOOL_READ", "get_message")
     GMAIL_MCP_TOOL_SEND = os.environ.get("GMAIL_MCP_TOOL_SEND", "send_message")
 else:
-    GMAIL_MCP_TOOL_SEARCH = os.environ.get("GMAIL_MCP_TOOL_SEARCH", "search_emails")
+    GMAIL_MCP_TOOL_SEARCH = os.environ.get("GMAIL_MCP_TOOL_SEARCH", "list_messages")
     GMAIL_MCP_TOOL_READ = os.environ.get("GMAIL_MCP_TOOL_READ", "read_email")
     GMAIL_MCP_TOOL_SEND = os.environ.get("GMAIL_MCP_TOOL_SEND", "send_email")
 
@@ -128,8 +139,17 @@ def log_error(func_name: str, message: str) -> None:
 
 
 def start_ollama() -> None:
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        for cand in ("/usr/local/bin/ollama", "/opt/homebrew/bin/ollama"):
+            if os.path.exists(cand):
+                ollama_bin = cand
+                break
+    if not ollama_bin:
+        _error_log_write("start_ollama", "Could not find 'ollama' binary in PATH")
+        return
     subprocess.Popen(
-        ["ollama", "serve"],
+        [ollama_bin, "serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -349,123 +369,91 @@ def _remove_image_artifacts(text: str) -> str:
     return re.sub(r"\[(?:image|logo|img)\]", "", text, flags=re.IGNORECASE)
 
 
-class _MCPStdioSession:
-    """Minimal MCP client over stdio (JSON-RPC + Content-Length framing)."""
-
-    def __init__(self, argv: List[str]) -> None:
-        env = os.environ.copy()
-        if "GMAIL_MCP_CREDENTIALS" not in env:
-            env["GMAIL_MCP_CREDENTIALS"] = GMAIL_MCP_CREDENTIALS
-        self._proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            bufsize=0,
-        )
-        self._lock = threading.Lock()
-        self._next_id = 1
-        self._initialize()
-
-    def close(self) -> None:
-        if self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-
-    def _write_message(self, payload: Dict[str, Any]) -> None:
-        assert self._proc.stdin is not None
-        raw = json.dumps(payload, separators=(",", ":")) + "\n"
-        self._proc.stdin.write(raw.encode("utf-8"))
-        self._proc.stdin.flush()
-
-    def _read_one_message(self) -> Dict[str, Any]:
-        assert self._proc.stdout is not None
-        line = self._proc.stdout.readline()
-        if not line:
-            raise RuntimeError("MCP process closed stdout unexpectedly")
-        return json.loads(line.decode("utf-8"))
-
-    def _initialize(self) -> None:
-        req_id = self._next_id
-        self._next_id += 1
-        self._write_message(
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ai-news-digest", "version": "1.0.0"},
-                },
-            }
-        )
-        import threading, time
-
-        # Give the process a moment to start
-        time.sleep(2)
-
-        # Check if process already died
-        if self._proc.poll() is not None:
-            stderr_out = self._proc.stderr.read().decode(errors="replace")
-            raise RuntimeError(f"MCP process exited immediately. stderr: {stderr_out}")
-
-        # Peek at stderr in background thread
-        def _drain_stderr(proc):
-            for line in proc.stderr:
-                print("[MCP stderr]", line.decode(errors="replace"), end="", flush=True)
-
-        threading.Thread(target=_drain_stderr, args=(self._proc,), daemon=True).start()
-
-        while True:
-            msg = self._read_one_message()
-            if msg.get("id") == req_id:
-                if "error" in msg:
-                    raise RuntimeError(f"MCP initialize error: {msg['error']}")
+def _ensure_gmail_mcp_running() -> Optional[subprocess.Popen]:
+    """Start Gmail MCP HTTP server if not already running on port 3000."""
+    # Check if port 3000 is already in use
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("localhost", 3000)) == 0:
+            return None  # already running
+    # Start it
+    npx_bin = shutil.which("npx")
+    if not npx_bin:
+        for cand in ("/opt/homebrew/bin/npx", "/usr/local/bin/npx"):
+            if os.path.exists(cand):
+                npx_bin = cand
                 break
-        self._write_message(
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            }
-        )
+    if not npx_bin:
+        _error_log_write("_ensure_gmail_mcp_running", "Could not find 'npx' binary in PATH")
+        return None
+    proc = subprocess.Popen(
+        [npx_bin, "@shinzolabs/gmail-mcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(3)  # give it time to bind
+    return proc
 
-    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        with self._lock:
-            req_id = self._next_id
-            self._next_id += 1
-            self._write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "tools/call",
-                    "params": {"name": name, "arguments": arguments or {}},
-                }
+
+class _MCPHTTPSession:
+    """Talks to an already-running MCP HTTP server (e.g. gmail-mcp on port 3000)."""
+
+    def __init__(self, base_url: str = "http://localhost:3000/mcp"):
+        self.base_url = base_url
+        self._session_id: str | None = None
+
+    async def __aenter__(self):
+        async with aiohttp.ClientSession() as s:
+            resp = await s.post(
+                self.base_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2024-11-05",
+                                 "capabilities": {},
+                                 "clientInfo": {"name": "digest", "version": "1.0"}}},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
             )
-            while True:
-                msg = self._read_one_message()
-                if msg.get("method") == "notifications/message":
-                    continue
-                if msg.get("id") == req_id:
-                    if "error" in msg:
-                        raise RuntimeError(f"MCP tools/call error: {msg['error']}")
-                    return msg.get("result")
+            self._session_id = resp.headers.get("Mcp-Session-Id")
+        return self
 
+    async def __aexit__(self, *_):
+        pass  # HTTP server manages its own lifecycle
 
-_mcp_session: Optional[_MCPStdioSession] = None
+    async def call(self, tool: str, params: dict) -> dict:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id is not None:
+            headers["Mcp-Session-Id"] = self._session_id
 
+        async with aiohttp.ClientSession() as s:
+            resp = await s.post(
+                self.base_url,
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "params": {"name": tool, "arguments": params}},
+                headers=headers,
+            )
+            text = await resp.text()
 
-def _get_mcp_session() -> _MCPStdioSession:
-    global _mcp_session
-    if _mcp_session is None:
-        argv = [GMAIL_MCP_COMMAND] + GMAIL_MCP_ARGS
-        _mcp_session = _MCPStdioSession(argv)
-    return _mcp_session
+        # Response may be SSE-wrapped: strip "data: " prefix lines
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                import json as _json
+                payload = _json.loads(line[6:])
+                if "error" in payload:
+                    raise RuntimeError(payload["error"].get("message", str(payload["error"])))
+                result = payload.get("result", {})
+                content = result.get("content", [{}])
+                if content and "text" in content[0]:
+                    import json as _json2
+                    try:
+                        return _json2.loads(content[0]["text"])
+                    except Exception:
+                        return {"raw": content[0]["text"]}
+                return result
+        return {}
 
 
 def _mcp_result_to_text(result: Any) -> str:
@@ -487,24 +475,25 @@ def _mcp_result_to_text(result: Any) -> str:
 
 
 def _mcp_search_args(query: str, max_results: int) -> Dict[str, Any]:
-    flavor = os.environ.get("GMAIL_MCP_FLAVOR", "").lower()
-    if flavor == "shinzo":
-        return {"q": query, "maxResults": max_results}
-    return {"query": query, "maxResults": max_results}
+    return {
+        "q": query,
+        "maxResults": max_results,
+        "includeSpamTrash": False,
+    }
 
 
 def _mcp_read_args(message_id: str) -> Dict[str, Any]:
-    flavor = os.environ.get("GMAIL_MCP_FLAVOR", "").lower()
+    flavor = os.environ.get("GMAIL_MCP_FLAVOR", "shinzo").lower()
     if flavor == "shinzo":
-        return {"messageId": message_id}
+        return {"id": message_id}
     return {"messageId": message_id}
 
 
 def _mcp_send_args(to_list: List[str], subject: str, body: str) -> Dict[str, Any]:
-    flavor = os.environ.get("GMAIL_MCP_FLAVOR", "").lower()
+    flavor = os.environ.get("GMAIL_MCP_FLAVOR", "shinzo").lower()
     if flavor == "shinzo":
         return {
-            "to": ",".join(to_list),
+            "to": to_list,
             "subject": subject,
             "body": body,
             "mimeType": "text/plain",
@@ -576,6 +565,10 @@ def _parse_search_lines(text: str) -> List[Dict[str, str]]:
 
 
 def _search_result_to_entries(raw_result: Any) -> List[Dict[str, str]]:
+    if isinstance(raw_result, dict) and isinstance(raw_result.get("messages"), list):
+        parsed = _parse_search_json(raw_result)
+        if parsed:
+            return parsed
     text = _mcp_result_to_text(raw_result).strip()
     if not text:
         return []
@@ -591,6 +584,64 @@ def _search_result_to_entries(raw_result: Any) -> List[Dict[str, str]]:
 
 def _parse_read_email_block(text: str) -> Tuple[str, str, str, str, str]:
     """Returns (id_guess, subject, from_hdr, date_hdr, body)."""
+    def _decode_b64url(data: str) -> str:
+        if not data:
+            return ""
+        pad = "=" * ((4 - len(data) % 4) % 4)
+        try:
+            raw = base64.urlsafe_b64decode((data + pad).encode("utf-8"))
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _extract_body_from_payload(payload: Dict[str, Any]) -> str:
+        parts: List[str] = []
+
+        def _walk(node: Dict[str, Any]) -> None:
+            mime = str(node.get("mimeType") or "").lower()
+            body = node.get("body", {}) if isinstance(node.get("body"), dict) else {}
+            data = body.get("data") if isinstance(body, dict) else None
+            decoded = _decode_b64url(str(data)) if data else ""
+            if decoded:
+                if mime == "text/plain":
+                    parts.append(decoded)
+                elif mime == "text/html":
+                    parts.append(_strip_html(decoded))
+                elif not mime:
+                    parts.append(decoded)
+            for ch in node.get("parts", []) if isinstance(node.get("parts"), list) else []:
+                if isinstance(ch, dict):
+                    _walk(ch)
+
+        _walk(payload)
+        merged = "\n\n".join(p.strip() for p in parts if p and p.strip()).strip()
+        return merged
+
+    jtxt = text.strip()
+    if jtxt.startswith("{"):
+        try:
+            obj = json.loads(jtxt)
+            if isinstance(obj, dict):
+                payload = obj.get("payload", {}) if isinstance(obj.get("payload"), dict) else {}
+                hdrs = payload.get("headers", []) if isinstance(payload.get("headers"), list) else []
+                subject = from_hdr = date_hdr = ""
+                for h in hdrs:
+                    if not isinstance(h, dict):
+                        continue
+                    n = (h.get("name") or "").lower()
+                    v = str(h.get("value") or "").strip()
+                    if n == "subject":
+                        subject = v
+                    elif n == "from":
+                        from_hdr = v
+                    elif n == "date":
+                        date_hdr = v
+                body = _extract_body_from_payload(payload)
+                if not body:
+                    body = str(obj.get("snippet") or "").strip()
+                return (str(obj.get("threadId") or ""), subject, from_hdr, date_hdr, body)
+        except (json.JSONDecodeError, TypeError):
+            pass
     subject = ""
     from_hdr = ""
     date_hdr = ""
@@ -638,80 +689,95 @@ def _in_window(dt_ny: datetime, day_date: date, win_lo: dt_time, win_hi: dt_time
 def fetch_emails_in_window() -> List[Dict[str, Any]]:
     """
     Fetch full content of every inbox message whose Date falls inside today's
-    NY window. Uses Gmail MCP (stdio subprocess). Each MCP call is wrapped in try/except by caller pattern in main;
+    NY window. Uses Gmail MCP (HTTP server). Each MCP call is wrapped in try/except by caller pattern in main;
     this function wraps search + per-message read.
     """
-    ny = _ny_tz()
-    now_ny = datetime.now(ny)
-    day = now_ny.date()
+    async def _run() -> List[Dict[str, Any]]:
+        ny = _ny_tz()
+        now_ny = datetime.now(ny)
+        day = now_ny.date()
 
-    session = _get_mcp_session()
-    query = "in:inbox newer_than:5d"
-    try:
-        raw_result = session.call_tool(
-            GMAIL_MCP_TOOL_SEARCH, _mcp_search_args(query, max_results=500)
-        )
-    except Exception as e:
-        raise RuntimeError(f"Gmail MCP search failed: {e}") from e
+        after_d = day.strftime("%Y/%m/%d")
+        before_d = (day + timedelta(days=1)).strftime("%Y/%m/%d")
+        query = f"after:{after_d} before:{before_d}"
 
-    summaries = _search_result_to_entries(raw_result)
+        raw_emails: List[Dict[str, Any]] = []
+        win_lo = dt_time(START_HOUR, START_MINUTE)
+        win_hi = dt_time(END_HOUR, END_MINUTE)
 
-    raw_emails: List[Dict[str, Any]] = []
-    win_lo = dt_time(START_HOUR, START_MINUTE)
-    win_hi = dt_time(END_HOUR, END_MINUTE)
-
-    for summ in summaries:
-        mid = summ.get("id", "").strip()
-        if not mid:
-            continue
-        date_hdr = summ.get("date", "")
-        if date_hdr.isdigit() and len(date_hdr) >= 10:
+        async with _MCPHTTPSession() as session:
             try:
-                ms = int(date_hdr)
-                recv = datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc).astimezone(
-                    ny
+                raw_result = await session.call(
+                    GMAIL_MCP_TOOL_SEARCH,
+                    _mcp_search_args(query, max_results=500),
                 )
-            except (OSError, ValueError):
-                try:
-                    recv = _parse_received_at(date_hdr)
-                except Exception:
+            except Exception as e:
+                raise RuntimeError(f"Gmail MCP search failed: {e}") from e
+
+            summaries = _search_result_to_entries(raw_result)
+
+            for summ in summaries:
+                mid = summ.get("id", "").strip()
+                if not mid:
                     continue
-        else:
-            try:
-                recv = _parse_received_at(date_hdr)
-            except Exception:
-                continue
-        if not _in_window(recv, day, win_lo, win_hi):
-            continue
-        try:
-            r = session.call_tool(GMAIL_MCP_TOOL_READ, _mcp_read_args(mid))
-        except Exception as e:
-            _error_log_write(
-                "fetch_emails_in_window",
-                str(e),
-                extra=f"messageId={mid} subject={summ.get('subject','')}",
-            )
-            continue
-        body_text = _mcp_result_to_text(r)
-        _, subj, from_h, date_h, body = _parse_read_email_block(body_text)
-        try:
-            recv2 = _parse_received_at((date_h or date_hdr).strip() or date_hdr)
-        except Exception:
-            recv2 = recv
-        if not _in_window(recv2, day, win_lo, win_hi):
-            continue
-        raw_emails.append(
-            {
-                "id": mid,
-                "search_summary": summ,
-                "read_text": body_text,
-                "subject": subj or summ.get("subject", ""),
-                "from_header": from_h or summ.get("from", ""),
-                "date_header": date_h or date_hdr,
-                "body": body,
-            }
-        )
-    return raw_emails
+                date_hdr = summ.get("date", "")
+                recv: Optional[datetime] = None
+                if date_hdr:
+                    if date_hdr.isdigit() and len(date_hdr) >= 10:
+                        try:
+                            ms = int(date_hdr)
+                            recv = datetime.fromtimestamp(
+                                ms / 1000.0, tz=datetime.timezone.utc
+                            ).astimezone(ny)
+                        except (OSError, ValueError):
+                            try:
+                                recv = _parse_received_at(date_hdr)
+                            except Exception:
+                                recv = None
+                    else:
+                        try:
+                            recv = _parse_received_at(date_hdr)
+                        except Exception:
+                            recv = None
+                if recv is not None and not _in_window(recv, day, win_lo, win_hi):
+                    continue
+                try:
+                    r = await session.call(
+                        GMAIL_MCP_TOOL_READ,
+                        _mcp_read_args(mid),
+                    )
+                except Exception as e:
+                    _error_log_write(
+                        "fetch_emails_in_window",
+                        str(e),
+                        extra=f"messageId={mid} subject={summ.get('subject','')}",
+                    )
+                    continue
+                body_text = _mcp_result_to_text(r)
+                _, subj, from_h, date_h, body = _parse_read_email_block(body_text)
+                try:
+                    recv2 = _parse_received_at((date_h or date_hdr).strip() or date_hdr)
+                except Exception:
+                    if recv is not None:
+                        recv2 = recv
+                    else:
+                        continue
+                if not _in_window(recv2, day, win_lo, win_hi):
+                    continue
+                raw_emails.append(
+                    {
+                        "id": mid,
+                        "search_summary": summ,
+                        "read_text": body_text,
+                        "subject": subj or summ.get("subject", ""),
+                        "from_header": from_h or summ.get("from", ""),
+                        "date_header": date_h or date_hdr,
+                        "body": body,
+                    }
+                )
+        return raw_emails
+
+    return asyncio.run(_run())
 
 
 def filter_unprocessed(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1072,31 +1138,31 @@ def build_digest(
 
 
 def _send_email_mcp(subject: str, body: str) -> Dict[str, Any]:
-    session = _get_mcp_session()
-    results = {"ok": [], "fail": []}
-    for recipient in DIGEST_RECIPIENTS:
-        try:
-            session.call_tool(
-                GMAIL_MCP_TOOL_SEND,
-                _mcp_send_args([recipient], subject, body),
-            )
-            results["ok"].append(recipient)
-        except Exception as e:
-            _error_log_write(
-                "_send_email_mcp",
-                str(e),
-                extra=f"recipient={recipient}",
-            )
-            results["fail"].append((recipient, str(e)))
-    return results
+    async def _run() -> Dict[str, Any]:
+        results = {"ok": [], "fail": []}
+        async with _MCPHTTPSession() as session:
+            for recipient in DIGEST_RECIPIENTS:
+                try:
+                    await session.call(
+                        GMAIL_MCP_TOOL_SEND,
+                        _mcp_send_args([recipient], subject, body),
+                    )
+                    results["ok"].append(recipient)
+                except Exception as e:
+                    _error_log_write(
+                        "_send_email_mcp",
+                        str(e),
+                        extra=f"recipient={recipient}",
+                    )
+                    results["fail"].append((recipient, str(e)))
+        return results
+
+    return asyncio.run(_run())
 
 
 def send_digest(digest_text: str) -> Dict[str, Any]:
     ny = _now_ny()
-    subject = (
-        f"🤖 AI Morning Digest — {ny.strftime('%A, %B ')}"
-        f"{int(ny.strftime('%d'))}, {ny.strftime('%Y')}"
-    )
+    subject = f"AI Morning Digest - {ny.strftime('%A, %B ')}{int(ny.strftime('%d'))}, {ny.strftime('%Y')}"
     return _send_email_mcp(subject, digest_text)
 
 
@@ -1136,6 +1202,95 @@ def log_run(stats: Dict[str, Any]) -> None:
         _error_log_write("log_run", str(e), "")
 
 
+def _digest_log_lines_for_date(date_str: str) -> List[str]:
+    out: List[str] = []
+    if not os.path.exists(RUN_LOG):
+        return out
+    try:
+        with open(RUN_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"[{date_str}"):
+                    out.append(line)
+    except OSError:
+        pass
+    return out
+
+
+def _log_line_status(line: str) -> str:
+    m = re.search(r"\|\s*status=(\S+)", line)
+    return m.group(1).strip() if m else "UNKNOWN"
+
+
+def _tail_file(path: str, max_chars: int = 6000) -> str:
+    if not os.path.exists(path):
+        return f"(no {path})"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        return data[-max_chars:] if len(data) > max_chars else data
+    except OSError as e:
+        return f"(could not read {path}: {e})"
+
+
+def run_digest_post_check() -> int:
+    """Optional 10:10 cron: email if today's digest did not log SUCCESS (or no log at all)."""
+    today = _now_ny().strftime("%Y-%m-%d")
+    lines = _digest_log_lines_for_date(today)
+    if not lines:
+        time.sleep(120)
+        lines = _digest_log_lines_for_date(today)
+
+    mcp_proc = _ensure_gmail_mcp_running()
+    try:
+        if not lines:
+            subj = f"⚠️ Digest post-check — no run logged ({today})"
+            body = (
+                f"No line was written to {RUN_LOG} for {today} after waiting for the digest job. "
+                f"The agent may not have run (Mac asleep, cron, or it exited before logging—e.g. Ollama down).\n\n"
+                f"Expected digest cron: ~{RUN_DIGEST_HOUR:02d}:{RUN_DIGEST_MINUTE:02d} weekdays.\n\n"
+                f"--- {ERROR_LOG} (tail) ---\n"
+                f"{_tail_file(ERROR_LOG)}"
+            )
+            _send_email_mcp(subj, body)
+            return 0
+
+        last = lines[-1]
+        st = _log_line_status(last)
+        if st == "SUCCESS":
+            print("Digest post-check: OK (latest log status SUCCESS).", flush=True)
+            return 0
+
+        if st == "FAILED":
+            subj = f"⚠️ Digest post-check — run FAILED ({today})"
+            body = (
+                f"Latest line in {RUN_LOG} for today:\n{last}\n\n"
+                f"--- {ERROR_LOG} (tail) ---\n"
+                f"{_tail_file(ERROR_LOG)}"
+            )
+        elif st == "PARTIAL":
+            subj = f"📋 Digest post-check — PARTIAL send ({today})"
+            body = (
+                f"Latest line for today:\n{last}\n\n"
+                f"Some recipients may have failed. Review {ERROR_LOG}.\n\n"
+                f"--- {ERROR_LOG} (tail) ---\n"
+                f"{_tail_file(ERROR_LOG)}"
+            )
+        else:
+            subj = f"⚠️ Digest post-check — unclear status ({today})"
+            body = f"Latest line:\n{last}\n\n{_tail_file(ERROR_LOG)}"
+
+        _send_email_mcp(subj, body)
+        return 0
+    finally:
+        if mcp_proc is not None:
+            try:
+                mcp_proc.terminate()
+                mcp_proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI Morning Digest agent")
     parser.add_argument(
@@ -1143,12 +1298,28 @@ def main() -> int:
         action="store_true",
         help="Fetch and build digest, print to stdout, do not send email or update logs",
     )
+    parser.add_argument(
+        "--post-check",
+        action="store_true",
+        help="Check digest_log for today's run; email if missing or not SUCCESS (for ~10:10 cron).",
+    )
     args = parser.parse_args()
     dry = args.dry_run
 
     _force = os.environ.get("DIGEST_FORCE_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    if args.post_check:
+        if not _force and datetime.now().weekday() >= 5:
+            return 0
+        return run_digest_post_check()
+
     if not is_within_allowed_window() and not _force:
-        print("Outside allowed window (Mon–Fri 4:30am–10:00am). Exiting.")
+        _end_mins = RUN_DIGEST_HOUR * 60 + RUN_DIGEST_MINUTE + RUN_DIGEST_GRACE_MINUTES
+        _end_h, _end_mi = divmod(_end_mins, 60)
+        print(
+            f"Outside allowed window (Mon–Fri digest run {RUN_DIGEST_HOUR:02d}:{RUN_DIGEST_MINUTE:02d}–"
+            f"{_end_h:02d}:{_end_mi:02d} local). Exiting."
+        )
         return 0
 
     stats: Dict[str, Any] = {
@@ -1165,6 +1336,7 @@ def main() -> int:
     }
 
     try:
+        mcp_proc = _ensure_gmail_mcp_running()
         start_ollama()
         if not check_ollama_running():
             subj = "⚠️ Digest Agent Error — Ollama not running"
@@ -1174,6 +1346,8 @@ def main() -> int:
             )
             if not dry:
                 _send_email_mcp(subj, body)
+                stats["status"] = "FAILED"
+                log_run(stats)
             else:
                 print(subj)
                 print(body)
@@ -1367,14 +1541,16 @@ def main() -> int:
             # STEP 10 — LOG THE RUN
             log_run(stats)
             return 0
-
         finally:
-            global _mcp_session
-            if _mcp_session is not None:
-                _mcp_session.close()
-                _mcp_session = None
+            pass
 
     finally:
+        if mcp_proc is not None:
+            try:
+                mcp_proc.terminate()
+                mcp_proc.wait(timeout=5)
+            except Exception:
+                pass
         stop_ollama()
 
 

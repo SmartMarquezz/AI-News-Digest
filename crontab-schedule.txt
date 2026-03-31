@@ -1,2 +1,11 @@
-30 4 * * 1-5 cd ~/AI\ News\ Digest && /usr/bin/python3 digest.py
-0 10 * * 1-5 pkill -f ollama
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# Weekday digest: run after the 4:30am–10:00am email window, default 10:05 local.
+# Installed for: /Users/ericmarquez/AI News Digest
+5 10 * * 1-5 cd /Users/ericmarquez/AI\ News\ Digest && /usr/bin/python3 digest.py
+
+# Post-check: email if digest did not log SUCCESS (or no log). Runs ~5 min after digest.
+10 10 * * 1-5 cd /Users/ericmarquez/AI\ News\ Digest && /usr/bin/python3 digest.py --post-check
+
+# Optional: safety net if a stray Ollama process survives after the script exits.
+0 11 * * 1-5 pkill -f ollama

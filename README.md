@@ -1,6 +1,6 @@
 # AI & Tech News Digest
 
-This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), extracts the highest-signal items with a **local Ollama** model (e.g. llama3.2) and **no paid APIs**, and emails you **one** plain-text digest grouped by newsletter. A processed-ID log stops the same email from being summarized twice.
+This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), extracts the highest-signal items with a **local Ollama** model (e.g. llama3.2) and **no paid APIs**, and emails you **one** plain-text digest grouped by newsletter—typically **after** that window, at **10:05am** local time (see `RUN_DIGEST_*` in `digest.py` and `crontab-schedule.txt`). A processed-ID log stops the same email from being summarized twice.
 
 ## Add a new recipient
 
@@ -17,7 +17,7 @@ DIGEST_RECIPIENTS = [
 
 Delete that person’s line from `DIGEST_RECIPIENTS` in `digest.py`.
 
-## Change the time window
+## Change the email window (which messages are included)
 
 In `digest.py`, edit these four variables only:
 
@@ -28,9 +28,9 @@ END_HOUR = 10
 END_MINUTE = 0
 ```
 
-## When the script is allowed to run (Ollama)
+## When the script is allowed to run (digest schedule)
 
-The script only starts **Ollama** on **Monday–Friday**, **4:30am–10:00am local time** (`is_within_allowed_window()` in `digest.py`). Outside that window it exits immediately (unless `DIGEST_FORCE_RUN=1` for testing). Schedule the run with **cron** using `crontab-schedule.txt` in this repo.
+The script only runs the full pipeline on **Monday–Friday**, starting at **`RUN_DIGEST_HOUR` / `RUN_DIGEST_MINUTE`** (default **10:05** local time) through **`RUN_DIGEST_GRACE_MINUTES`** later (`is_within_allowed_window()` in `digest.py`). That is **separate** from the email window above: messages are still filtered to 4:30am–10:00am, but the job is meant to run once after that window ends so the digest includes all of them. Outside the digest run window it exits immediately (unless `DIGEST_FORCE_RUN=1` for testing). Schedule the run with **cron** using `crontab-schedule.txt` in this repo. A second job at **10:10** runs `python3 digest.py --post-check`: it emails you if **no line** was written to `digest_log.txt` for today (digest may not have run) or if the latest line shows **FAILED**, **PARTIAL**, or an unknown status. A **SUCCESS** log (including “no newsletters” runs) does not trigger that email.
 
 ## Run the script manually
 
