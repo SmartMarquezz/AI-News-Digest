@@ -68,7 +68,7 @@ python3 digest.py --dry-run
 
 ## Gmail MCP (required for live runs)
 
-`digest.py` does **not** use SMTP, IMAP, or the Gmail Python client libraries. It talks to your **Gmail MCP server** over the standard MCP stdio protocol (same idea as in Cursor): it starts a subprocess (`npx …` by default), then calls tools such as search/list, read, and send.
+`digest.py` does **not** use SMTP, IMAP, or the Gmail Python client libraries. It talks to your **Gmail MCP HTTP server** (default `http://localhost:3000/mcp`), which can be started via `npx @shinzolabs/gmail-mcp` or left running in Cursor, then calls tools such as list/read/send.
 
 Defaults match the common **Shinzo Labs** server (`list_messages`, `get_message`, `send_message`). Override if your Cursor Gmail MCP uses different tool names:
 
@@ -96,6 +96,10 @@ Copy the `command` and `args` from your Cursor MCP settings if yours differ. The
 3. Confirm Gmail MCP still works in Cursor (send/search a test message).
 4. Confirm your scheduled environment sets the same `GMAIL_MCP_*` variables and can run `npx` (or your server command) non-interactively.
 
-## Cron schedule (recommended)
+### Gmail OAuth expired or invalid
 
-Paste the two lines from **`crontab-schedule.txt`** into your crontab (`crontab -e`). That runs the digest at **4:30am** on weekdays and **`pkill -f ollama`** at **10:00am** as a safety net. Ensure `PATH` in your environment includes `npx` / Homebrew if needed.
+If logs or the terminal show **`OAuth2 credentials are invalid, please re-authenticate`**, the digest cannot list or send mail until you re-authenticate the **gmail-mcp** server (same OAuth files it uses in Cursor). Typical locations: `~/.config/gmail-mcp/credentials.json` (see `GMAIL_MCP_CREDENTIALS` in `digest.py`). Run your provider’s auth flow again (often `npx @shinzolabs/gmail-mcp` with login, or the auth command from their docs), then restart the MCP server on port 3000.
+
+## Cron / LaunchAgents
+
+Prefer **LaunchAgents** on macOS (see table at the top). The file **`crontab-schedule.txt`** is an optional reference if you use cron instead; adjust paths to match your machine.

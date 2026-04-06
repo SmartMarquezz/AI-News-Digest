@@ -394,6 +394,13 @@ def _ensure_gmail_mcp_running() -> Optional[subprocess.Popen]:
     return proc
 
 
+def _finalize_mcp_tool_result(obj: Any) -> Any:
+    """Raise if Gmail MCP embedded a tool-level error (OAuth, etc.) instead of API data."""
+    if isinstance(obj, dict) and obj.get("error"):
+        raise RuntimeError(f"Gmail MCP tool error: {obj['error']}")
+    return obj
+
+
 class _MCPHTTPSession:
     """Talks to an already-running MCP HTTP server (e.g. gmail-mcp on port 3000)."""
 
@@ -449,10 +456,11 @@ class _MCPHTTPSession:
                 if content and "text" in content[0]:
                     import json as _json2
                     try:
-                        return _json2.loads(content[0]["text"])
-                    except Exception:
+                        inner = _json2.loads(content[0]["text"])
+                    except (json.JSONDecodeError, TypeError):
                         return {"raw": content[0]["text"]}
-                return result
+                    return _finalize_mcp_tool_result(inner)
+                return _finalize_mcp_tool_result(result)
         return {}
 
 
