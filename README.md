@@ -1,6 +1,20 @@
 # AI & Tech News Digest
 
-This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), extracts the highest-signal items with a **local Ollama** model (e.g. llama3.2) and **no paid APIs**, and emails you **one** plain-text digest grouped by newsletter—typically **after** that window, at **10:05am** local time (see `RUN_DIGEST_*` in `digest.py` and `crontab-schedule.txt`). A processed-ID log stops the same email from being summarized twice.
+This project runs a small Python agent that, on weekdays, reads every newsletter in `learnmindsethub@gmail.com` that arrived between **4:30am and 10:00am** (America/New_York), extracts the highest-signal items with a **local Ollama** model (e.g. llama3.2) and **no paid APIs**, and emails you **one** plain-text digest grouped by newsletter—typically **after** that window, at **10:05am** local time (see `RUN_DIGEST_*` in `digest.py`). A processed-ID log stops the same email from being summarized twice.
+
+### Scheduling on macOS (recommended)
+
+Use **LaunchAgents** (not cron) so jobs run in your GUI session with a full `PATH`:
+
+| Job | When | What |
+|-----|------|------|
+| `com.ai-news-digest.daily` | Weekdays **10:05** | Full digest |
+| `com.ai-news-digest.postcheck` | Weekdays **10:10** | `python3 digest.py --post-check` (alert if no SUCCESS log) |
+| `com.ai-news-digest.catchup` | Weekdays **10:40** | `python3 digest.py --catch-up` (runs **only if** `digest_log.txt` has **no** SUCCESS line for today—covers missed 10:05 when the Mac was asleep) |
+
+Logs: `launchd-digest.out.log`, `launchd-digest.err.log`, `launchd-postcheck.*`, `launchd-catchup.*` in the project folder.
+
+**Reliability:** The Mac must be **awake and logged in** around 10:05. If it slept through 10:05, the **10:40 catch-up** can still send the digest. Optionally use **Energy Saver → Schedule** or `pmset` to wake the machine a few minutes before 10:05.
 
 ## Add a new recipient
 
@@ -30,7 +44,7 @@ END_MINUTE = 0
 
 ## When the script is allowed to run (digest schedule)
 
-The script only runs the full pipeline on **Monday–Friday**, starting at **`RUN_DIGEST_HOUR` / `RUN_DIGEST_MINUTE`** (default **10:05** local time) through **`RUN_DIGEST_GRACE_MINUTES`** later (`is_within_allowed_window()` in `digest.py`). That is **separate** from the email window above: messages are still filtered to 4:30am–10:00am, but the job is meant to run once after that window ends so the digest includes all of them. Outside the digest run window it exits immediately (unless `DIGEST_FORCE_RUN=1` for testing). Schedule the run with **cron** using `crontab-schedule.txt` in this repo. A second job at **10:10** runs `python3 digest.py --post-check`: it emails you if **no line** was written to `digest_log.txt` for today (digest may not have run) or if the latest line shows **FAILED**, **PARTIAL**, or an unknown status. A **SUCCESS** log (including “no newsletters” runs) does not trigger that email.
+The script only runs the full pipeline on **Monday–Friday**, starting at **`RUN_DIGEST_HOUR` / `RUN_DIGEST_MINUTE`** (default **10:05** local time) through **`RUN_DIGEST_GRACE_MINUTES`** later (`is_within_allowed_window()` in `digest.py`). That is **separate** from the email window above: messages are still filtered to 4:30am–10:00am, but the job is meant to run once after that window ends so the digest includes all of them. Outside the digest run window it exits immediately (unless `DIGEST_FORCE_RUN=1` for testing, or `--catch-up` after a missed run). **Post-check** at **10:10** runs `python3 digest.py --post-check`: it emails you if **no line** was written to `digest_log.txt` for today (digest may not have run) or if the latest line shows **FAILED**, **PARTIAL**, or an unknown status. A **SUCCESS** log (including “no newsletters” runs) does not trigger that email.
 
 ## Run the script manually
 

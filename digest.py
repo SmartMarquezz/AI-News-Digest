@@ -25,7 +25,7 @@ END_MINUTE = 0  # :00 → so 10:00am
 # after that window closes so every eligible email is included in one digest.
 RUN_DIGEST_HOUR = 10
 RUN_DIGEST_MINUTE = 5
-RUN_DIGEST_GRACE_MINUTES = 60  # latest start time after RUN_DIGEST_* (handles cron skew / long runs)
+RUN_DIGEST_GRACE_MINUTES = 120  # latest start time after RUN_DIGEST_* (late wake / long runs)
 
 # Maximum news bullets to extract per newsletter
 # Keeps each source section focused and prevents one newsletter dominating the digest
@@ -1162,7 +1162,10 @@ def _send_email_mcp(subject: str, body: str) -> Dict[str, Any]:
 
 def send_digest(digest_text: str) -> Dict[str, Any]:
     ny = _now_ny()
-    subject = f"AI Morning Digest - {ny.strftime('%A, %B ')}{int(ny.strftime('%d'))}, {ny.strftime('%Y')}"
+    subject = (
+        f"AI Morning Digest - {ny.strftime('%A, %B ')}{int(ny.strftime('%d'))}, {ny.strftime('%Y')} "
+        f"[{ny.strftime('%Y%m%d')}]"
+    )
     return _send_email_mcp(subject, digest_text)
 
 
@@ -1220,6 +1223,15 @@ def _digest_log_lines_for_date(date_str: str) -> List[str]:
 def _log_line_status(line: str) -> str:
     m = re.search(r"\|\s*status=(\S+)", line)
     return m.group(1).strip() if m else "UNKNOWN"
+
+
+def _digest_run_logged_success_today() -> bool:
+    """True if digest_log already has any SUCCESS line for today's NY date."""
+    today = _now_ny().strftime("%Y-%m-%d")
+    for line in _digest_log_lines_for_date(today):
+        if _log_line_status(line) == "SUCCESS":
+            return True
+    return False
 
 
 def _tail_file(path: str, max_chars: int = 6000) -> str:
@@ -1303,6 +1315,11 @@ def main() -> int:
         action="store_true",
         help="Check digest_log for today's run; email if missing or not SUCCESS (for ~10:10 cron).",
     )
+    parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        help="Weekday backup: run full digest only if digest_log has no SUCCESS line for today yet.",
+    )
     args = parser.parse_args()
     dry = args.dry_run
 
@@ -1313,7 +1330,17 @@ def main() -> int:
             return 0
         return run_digest_post_check()
 
-    if not is_within_allowed_window() and not _force:
+    if args.catch_up:
+        if not _force and datetime.now().weekday() >= 5:
+            return 0
+        if _digest_run_logged_success_today():
+            print(
+                "Catch-up: digest already logged SUCCESS today; skipping duplicate run.",
+                flush=True,
+            )
+            return 0
+        # Allow run outside the normal window (e.g. Mac woke late); weekdays only above.
+    elif not is_within_allowed_window() and not _force:
         _end_mins = RUN_DIGEST_HOUR * 60 + RUN_DIGEST_MINUTE + RUN_DIGEST_GRACE_MINUTES
         _end_h, _end_mi = divmod(_end_mins, 60)
         print(
